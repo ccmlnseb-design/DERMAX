@@ -1,56 +1,66 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <Arduino.h>
-#include "Chirale_TensorFlowLite.h"
-#include "dermax_model.h"
-#include "board_config.h"
-#include <TJpg_Decoder.h>   // For JPEG decoding
+#include <TensorFlowLite_ESP32.h>
+#include "dermax_model.h"   // must define `const unsigned char dermax_model[]` and `int dermax_model_len`
+#include "board_config.h"   // your ESP32-CAM pin config
 
-// ===========================
-// WiFi credentials
-// ===========================
-const char *ssid = "YOUR_WIFI_SSID";
-const char *password = "YOUR_WIFI_PASSWORD";
-
-// ===========================
-// TensorFlow Lite setup
-// ===========================
+// Arena for TFLM
 constexpr int kTensorArenaSize = 60 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
-Chirale::MicroInterpreter* interpreter;
+// TFLM globals
+tflite::MicroInterpreter* interpreter;
+tflite::ErrorReporter* error_reporter;
+tflite::MicroMutableOpResolver<10> resolver;  // reserve space for 10 ops
+const tflite::Model* model;
+TfLiteTensor* input;
+TfLiteTensor* output;
 
-#define INPUT_W 224
-#define INPUT_H 224
-#define INPUT_C 3
-#define INPUT_SIZE (INPUT_W * INPUT_H * INPUT_C)
-#define NUM_CLASSES 7
+// ==================== WiFi ====================
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
 
-// ===========================
-// Function prototypes
-// ===========================
-void startCameraServer();
-void setupLedFlash();
-void runDermaxInference(camera_fb_t* fb);
-void processCameraFrame();
-
-// ===========================
-// Setup
-// ===========================
+// ==================== Setup ====================
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
 
-  // --- TensorFlow setup ---
-  interpreter = new Chirale::MicroInterpreter(dermax_model, tensor_arena, kTensorArenaSize);
-  if (!interpreter->AllocateTensors()) {
-    Serial.println("Tensor allocation failed!");
-    while (true);
+  // -------- Load Model --------
+  model = tflite::GetModel(dermax_model);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.println("❌ Model schema version mismatch!");
+    while (1);
   }
-  Serial.println("TensorFlow Lite Micro ready.");
 
-  // --- Camera configuration ---
+  // -------- Add Required Ops --------
+  resolver.AddConv2D();
+  resolver.AddDepthwiseConv2D();
+  resolver.AddFullyConnected();
+  resolver.AddAveragePool2D();
+  resolver.AddReshape();
+  resolver.AddSoftmax();
+
+  // -------- Error Reporter --------
+  static tflite::MicroErrorReporter micro_error_reporter;
+  error_reporter = &micro_error_reporter;
+
+  // -------- Interpreter --------
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("❌ Tensor allocation failed!");
+    while (1);
+  }
+
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+
+  Serial.println("✅ TensorFlow Lite Micro ready.");
+
+  // -------- Camera Config --------
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -71,141 +81,73 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;   // smaller to save RAM
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
+  config.frame_size = FRAMESIZE_QVGA;   // 320x240
+  config.pixel_format = PIXFORMAT_RGB565; // easier for TFLM
   config.fb_count = 1;
 
-  if (config.pixel_format == PIXFORMAT_JPEG && psramFound()) {
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("❌ Camera init failed");
+    while (1);
   }
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    return;
-  }
-
-  sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_QVGA);
-
-#if defined(LED_GPIO_NUM)
-  setupLedFlash();
-#endif
-
-  // --- WiFi connection ---
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.println("WiFi connected");
-
-  // --- Start camera server ---
-  startCameraServer();
-  Serial.print("Camera Ready! Connect to: http://");
-  Serial.println(WiFi.localIP());
+  Serial.println("✅ Camera ready.");
 }
 
-// ===========================
-// JPEG decode helper (TJpgDec output callback)
-// ===========================
-static uint16_t* rgbBuffer;
-static int rgbIndex;
-bool tjpgCallback(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t* bitmap) {
-  for (int j = 0; j < h; j++) {
-    for (int i = 0; i < w; i++) {
-      uint16_t pixel = bitmap[j * w + i];
-      uint8_t r = (pixel >> 11) & 0x1F;
-      uint8_t g = (pixel >> 5) & 0x3F;
-      uint8_t b = pixel & 0x1F;
-      r = (r * 255) / 31;
-      g = (g * 255) / 63;
-      b = (b * 255) / 31;
-
-      rgbBuffer[rgbIndex++] = (r << 16) | (g << 8) | b;
-    }
-  }
-  return true;
-}
-
-// ===========================
-// DERMAX inference
-// ===========================
-void runDermaxInference(camera_fb_t* fb) {
-  // --- Decode JPEG into RGB buffer ---
-  rgbIndex = 0;
-  TJpgDec.setJpgScale(1);  // full size
-  TJpgDec.setCallback(tjpgCallback);
-  rgbBuffer = (uint16_t*)malloc(fb->width * fb->height * sizeof(uint16_t));
-  TJpgDec.drawJpg(0, 0, fb->buf, fb->len);
-
-  // --- Resize + normalize into input tensor ---
-  float* input = interpreter->input(0)->data.f;
-  int idx = 0;
-  for (int y = 0; y < INPUT_H; y++) {
-    for (int x = 0; x < INPUT_W; x++) {
-      int srcX = x * fb->width / INPUT_W;
-      int srcY = y * fb->height / INPUT_H;
-      uint32_t pixel = rgbBuffer[srcY * fb->width + srcX];
-      uint8_t r = (pixel >> 16) & 0xFF;
-      uint8_t g = (pixel >> 8) & 0xFF;
-      uint8_t b = pixel & 0xFF;
-      input[idx++] = r / 255.0f;
-      input[idx++] = g / 255.0f;
-      input[idx++] = b / 255.0f;
-    }
-  }
-  free(rgbBuffer);
-
-  // --- Run inference ---
-  if (interpreter->Invoke() != kTfLiteOk) {
-    Serial.println("Inference failed!");
-    return;
-  }
-
-  // --- Read output ---
-  float* output = interpreter->output(0)->data.f;
-  int predicted_class = 0;
-  float max_val = output[0];
-  for (int i = 1; i < NUM_CLASSES; i++) {
-    if (output[i] > max_val) {
-      max_val = output[i];
-      predicted_class = i;
-    }
-  }
-  Serial.print("Predicted class: ");
-  Serial.print(predicted_class);
-  Serial.print(" (confidence: ");
-  Serial.print(max_val, 4);
-  Serial.println(")");
-}
-
-// ===========================
-// Capture frame and run inference
-// ===========================
-void processCameraFrame() {
-  camera_fb_t* fb = esp_camera_fb_get();
+// ==================== Run Inference ====================
+void runInference(camera_fb_t* fb) {
   if (!fb) {
-    Serial.println("Camera capture failed");
+    Serial.println("❌ Frame capture failed");
     return;
   }
 
-  runDermaxInference(fb);
-  esp_camera_fb_return(fb);
+  // Resize + normalize to fit input tensor
+  int input_w = input->dims->data[1];
+  int input_h = input->dims->data[2];
+  int input_c = input->dims->data[3];
+
+  uint8_t* in = fb->buf;
+  float* input_data = input->data.f;
+
+  int idx = 0;
+  for (int y = 0; y < input_h; y++) {
+    for (int x = 0; x < input_w; x++) {
+      int src_x = x * fb->width / input_w;
+      int src_y = y * fb->height / input_h;
+      int src_index = (src_y * fb->width + src_x) * 3;  // assuming RGB888
+
+      input_data[idx++] = in[src_index + 0] / 255.0f;  // R
+      input_data[idx++] = in[src_index + 1] / 255.0f;  // G
+      input_data[idx++] = in[src_index + 2] / 255.0f;  // B
+    }
+  }
+
+  // Run inference
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("❌ Inference failed");
+    return;
+  }
+
+  // Read results
+  int num_classes = output->dims->data[1];
+  float max_score = -1;
+  int predicted = -1;
+
+  for (int i = 0; i < num_classes; i++) {
+    float score = output->data.f[i];
+    Serial.printf("Class %d: %.4f\n", i, score);
+    if (score > max_score) {
+      max_score = score;
+      predicted = i;
+    }
+  }
+
+  Serial.printf("✅ Predicted class: %d (%.4f)\n", predicted, max_score);
 }
 
-// ===========================
-// Main loop
-// ===========================
+// ==================== Loop ====================
 void loop() {
-  processCameraFrame();
+  camera_fb_t* fb = esp_camera_fb_get();
+  runInference(fb);
+  esp_camera_fb_return(fb);
   delay(2000);
 }
