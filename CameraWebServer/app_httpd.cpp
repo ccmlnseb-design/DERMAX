@@ -841,8 +841,11 @@ void startCameraServer() {
 
 void setupLedFlash() {
 #if defined(LED_GPIO_NUM)
-  ledcAttach(LED_GPIO_NUM, 5000, 8);
+  int channel = 2;  // pick a free LEDC channel (0–15)
+  ledcSetup(channel, 5000, 8);           // freq=5kHz, resolution=8-bit
+  ledcAttachPin(LED_GPIO_NUM, channel);  // bind LED pin to this channel
 #else
   log_i("LED flash is disabled -> LED_GPIO_NUM undefined");
 #endif
 }
+
